@@ -174,18 +174,42 @@ jobs:
             PR_GUIDELINES.md
             README.md
           )
-          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMRT ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }})
-          DELETED_FILES=$(git diff --name-only --diff-filter=D ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }})
+          
+          if [ -n "${{ github.event.pull_request.base.sha }}" ] && [ -n "${{ github.event.pull_request.head.sha }}" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA=$(git merge-base origin/${{ github.event.pull_request.base.ref }} HEAD)
+            HEAD_SHA="HEAD"
+          fi
+          
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMRT "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || git diff --name-only --diff-filter=ACMRT)
+          DELETED_FILES=$(git diff --name-only --diff-filter=D "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || git diff --name-only --diff-filter=D)
+          
           SENSITIVE_CHANGED=false
           ALL_CHANGED_FILES=""
-          for PATTERN in "${SENSITIVE_FILES[@]}"; do
-            for FILE in $CHANGED_FILES $DELETED_FILES; do
-              if [[ "$FILE" == "$PATTERN" || "$FILE" =~ $PATTERN ]]; then
-                ALL_CHANGED_FILES+="$FILE "
-                SENSITIVE_CHANGED=true
+          
+          for FILE in $CHANGED_FILES $DELETED_FILES; do
+            for PATTERN in "${SENSITIVE_FILES[@]}"; do
+              PATTERN_CLEAN="${PATTERN//\"/}"
+              if [[ "$PATTERN_CLEAN" == *"*"* ]]; then
+                PATTERN_GLOB="${PATTERN_CLEAN//\*\*/.*}"
+                PATTERN_GLOB="${PATTERN_GLOB//\*/[^/]*}"
+                if [[ "$FILE" =~ ^${PATTERN_GLOB}$ ]]; then
+                  ALL_CHANGED_FILES+="$FILE "
+                  SENSITIVE_CHANGED=true
+                  break
+                fi
+              else
+                if [[ "$FILE" == "$PATTERN_CLEAN" ]]; then
+                  ALL_CHANGED_FILES+="$FILE "
+                  SENSITIVE_CHANGED=true
+                  break
+                fi
               fi
             done
           done
+          
           echo "all_changed_files=$ALL_CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "any_changed=$SENSITIVE_CHANGED" >> $GITHUB_OUTPUT
           echo "any_deleted=$([ -n "$DELETED_FILES" ] && echo "true" || echo "false")" >> $GITHUB_OUTPUT
@@ -195,11 +219,11 @@ jobs:
         if: steps.changed_files.outputs.any_changed == 'true' || steps.changed_files.outputs.any_deleted == 'true'
         name: Show changed files
         run: |
-          echo "Unauthorized changes were made in the following files:"
+          echo "::error::Unauthorized changes were made in the following sensitive files:"
           for FILE in ${CHANGED_FILES}; do
             echo "$FILE"
           done
-          echo "To override this, apply the 'ignore-sensitive-files-pr' label"
+          echo "::notice::To override this, apply the 'ignore-sensitive-files-pr' label to your PR."
           exit 1
 
   Run-Tests:
