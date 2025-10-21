@@ -115,7 +115,7 @@ jobs:
         run: docker container run talawa_api pnpm check_type_errors
 
   Check-Sensitive-Files:
-    if: ${{ github.actor != 'dependabot[bot]' && !contains(github.event.pull_request.labels.*.name, 'ignore-sensitive-files-pr') }}
+    if: ${{ github.actor != 'dependabot[bot]' }}
     name: Checks if sensitive files have been changed without authorization
     needs: [Code-Quality-Checks]
     runs-on: ubuntu-latest
@@ -125,10 +125,36 @@ jobs:
         with:
           fetch-depth: 0
       - id: changed_files
-        name: Get changed files
+        name: Get PR labels and changed files
         run: |
-          SENSITIVE_FILES=(
-            .coderabbit.yaml
+          # Install tools needed to fetch PR labels (gh + jq)
+          sudo apt-get update -y && sudo apt-get install -y jq
+
+          echo "Fetching PR labels to decide whether to skip sensitive-file checks"
+          PR_NUM=${{ github.event.pull_request.number }}
+
+          # Use the gh CLI to list labels (gh is available on GitHub Hosted runners)
+          LABELS_JSON=$(gh pr view $PR_NUM --json labels --jq '.labels') || LABELS_JSON="[]"
+          SKIP_LABEL=false
+          if echo "$LABELS_JSON" | jq -r '.[]?.name' | grep -qx "ignore-sensitive-files-pr"; then
+            SKIP_LABEL=true
+          fi
+          echo "skip_sensitive_checks=$SKIP_LABEL" >> $GITHUB_OUTPUT
+
+          # Compute BASE_SHA and HEAD_SHA robustly to support reruns and other contexts
+          # Prefer values from the event payload if present
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+
+          # If this is a rerun (check_suite or workflow_run), compute a merge-base to be safe
+          MERGE_BASE=$(git merge-base $BASE_SHA $HEAD_SHA || echo "")
+          if [ -n "$MERGE_BASE" ]; then
+            BASE_SHA=$MERGE_BASE
+          fi
+
+          # Define sensitive patterns as an array for easier iteration and readability
+          SENSITIVE_PATTERNS=(
+            ".coderabbit.yaml"
             Caddyfile
             codegen.ts
             "Dockerfile*"
@@ -174,32 +200,39 @@ jobs:
             PR_GUIDELINES.md
             README.md
           )
-          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMRT ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }})
-          DELETED_FILES=$(git diff --name-only --diff-filter=D ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }})
+          # Gather changed and deleted files using a three-dot diff to capture PR changes,
+          # and restrict to the computed BASE_SHA..HEAD_SHA
+          CHANGED_FILES=$(git diff --name-only --diff-filter=ACMRT $BASE_SHA...$HEAD_SHA)
+          DELETED_FILES=$(git diff --name-only --diff-filter=D $BASE_SHA...$HEAD_SHA)
+
           SENSITIVE_CHANGED=false
           ALL_CHANGED_FILES=""
-          for PATTERN in "${SENSITIVE_FILES[@]}"; do
-            for FILE in $CHANGED_FILES $DELETED_FILES; do
-              if [[ "$FILE" == "$PATTERN" || "$FILE" =~ $PATTERN ]]; then
-                ALL_CHANGED_FILES+="$FILE "
-                SENSITIVE_CHANGED=true
-              fi
-            done
+          for PATTERN in "${SENSITIVE_PATTERNS[@]}"; do
+            # For each pattern, check git diff using pathspec to handle globbing and directories
+            MATCHES=$(git diff --name-only --diff-filter=ACMRT $BASE_SHA...$HEAD_SHA -- "$PATTERN" || true)
+            MATCHES_DELETED=$(git diff --name-only --diff-filter=D $BASE_SHA...$HEAD_SHA -- "$PATTERN" || true)
+            if [ -n "$MATCHES" ] || [ -n "$MATCHES_DELETED" ]; then
+              SENSITIVE_CHANGED=true
+              ALL_CHANGED_FILES+="$MATCHES $MATCHES_DELETED "
+            fi
           done
+          # Trim leading/trailing whitespace
+          ALL_CHANGED_FILES=$(echo "$ALL_CHANGED_FILES" | sed -E 's/^\s+|\s+$//g')
+
           echo "all_changed_files=$ALL_CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "any_changed=$SENSITIVE_CHANGED" >> $GITHUB_OUTPUT
           echo "any_deleted=$([ -n "$DELETED_FILES" ] && echo "true" || echo "false")" >> $GITHUB_OUTPUT
 
-      - env:
+      - name: Report sensitive changes and fail when necessary
+        if: steps.changed_files.outputs.skip_sensitive_checks != 'true' && (steps.changed_files.outputs.any_changed == 'true' || steps.changed_files.outputs.any_deleted == 'true')
+        env:
           CHANGED_FILES: ${{ steps.changed_files.outputs.all_changed_files }}
-        if: steps.changed_files.outputs.any_changed == 'true' || steps.changed_files.outputs.any_deleted == 'true'
-        name: Show changed files
         run: |
-          echo "Unauthorized changes were made in the following files:"
+          echo "Unauthorized changes were made in the following sensitive files:"
           for FILE in ${CHANGED_FILES}; do
-            echo "$FILE"
+            echo "- $FILE"
           done
-          echo "To override this, apply the 'ignore-sensitive-files-pr' label"
+          echo "If these changes are intentional, add the 'ignore-sensitive-files-pr' label to this PR to skip this check."
           exit 1
 
   Run-Tests:
